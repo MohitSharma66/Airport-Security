@@ -91,8 +91,7 @@ with st.sidebar:
     st.caption("Start APIs with:\n`python thermal_api.py`\n`python xray_api.py`")
 
 # ============ TABBED INTERFACE ============
-tab1, tab2, tab3 = st.tabs(["🔥 Single Person Scan", "📦 X-Ray Baggage Scan", "👥 Queue Simulation (Multi-Person)"])
-
+tab1, tab2, tab3, tab4 = st.tabs(["🔥 Single Person Scan", "📦 X-Ray Baggage Scan", "👥 Queue Simulation (Multi-Person)", "🎬 Video Queue Simulation"])
 # Session state
 if 'thermal_result' not in st.session_state:
     st.session_state.thermal_result = None
@@ -499,5 +498,406 @@ with tab3:
                         import traceback
                         st.code(traceback.format_exc())
 
+# ============ TAB 4: VIDEO QUEUE SIMULATION (Thermal Only) ============
+with tab4:
+    st.header("🎬 Video Queue Simulation (Thermal Only)")
+    st.caption("Upload a stitched thermal video containing multiple people walking. The system extracts frames, detects people, and runs weapon detection on each person.")
+    
+    st.info("💡 **Video requirements:** Stitched thermal video with 2-4 people walking side-by-side.")
+    
+    # Video upload
+    video_file = st.file_uploader(
+        "Upload Stitched Thermal Video",
+        type=['mp4', 'avi', 'mov', 'mkv'],
+        key="video_queue"
+    )
+    
+    # Settings
+    col_settings1, col_settings2, col_settings3, col_settings4, col_settings5 = st.columns(5)
+    with col_settings1:
+        num_frames_to_extract = st.slider(
+            "Number of frames to extract", 
+            min_value=1, 
+            max_value=10, 
+            value=3,
+            help="Extract this many equally spaced frames from the video"
+        )
+    with col_settings2:
+        min_confirmation_frames = st.slider(
+            "Minimum frames for confirmation",
+            min_value=1,
+            max_value=5,
+            value=2,
+            help="Number of frames weapon must appear to raise alert"
+        )
+    with col_settings3:
+        confidence_threshold_video = st.slider(
+            "Confidence Threshold",
+            0.0, 1.0, 0.5, 0.05,
+            key="video_confidence"
+        )
+    with col_settings4:
+        padding_percent = st.slider(
+            "Person Crop Padding",
+            min_value=0.0,
+            max_value=0.8,
+            value=0.3,
+            step=0.05,
+            help="Add padding around detected person (0.3 = 30% extra space). Helps capture guns in pockets."
+        )
+    with col_settings5:
+        colormap_option = st.selectbox(
+            "Color Mapping",
+            options=["HOT", "INFERNO", "MAGMA", "PLASMA", "GRAY", "ORIGINAL"],
+            index=0,
+            help="Convert purple thermal videos to match training data appearance"
+        )
+    
+    # Colormap mapping
+    colormap_dict = {
+        "HOT": cv2.COLORMAP_HOT,
+        "INFERNO": cv2.COLORMAP_INFERNO,
+        "MAGMA": cv2.COLORMAP_MAGMA,
+        "PLASMA": cv2.COLORMAP_PLASMA,
+        "GRAY": None,
+        "ORIGINAL": "original"
+    }
+    
+    def preprocess_thermal_frame(frame, colormap_choice):
+        """Convert purple-ish thermal frames to match training data appearance."""
+        if colormap_choice == "ORIGINAL":
+            return frame
+        
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        if colormap_choice == "GRAY":
+            return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        
+        colormap_id = colormap_dict.get(colormap_choice)
+        if colormap_id is not None:
+            thermal_like = cv2.applyColorMap(gray, colormap_id)
+            thermal_like = cv2.convertScaleAbs(thermal_like, alpha=1.1, beta=5)
+            return thermal_like
+        
+        return frame
+    
+    def smart_crop_person(frame, bbox, padding):
+        """
+        Smart crop person from frame using YOLO bounding box + padding.
+        This preserves the entire person including lower body (where guns are often hidden).
+        """
+        x1, y1, x2, y2 = bbox
+        h, w = frame.shape[:2]
+        
+        # Calculate padding
+        box_w = x2 - x1
+        box_h = y2 - y1
+        pad_x = int(box_w * padding)
+        pad_y = int(box_h * padding)
+        
+        # Expand bbox with padding (clamp to frame edges)
+        new_x1 = max(0, x1 - pad_x)
+        new_x2 = min(w, x2 + pad_x)
+        new_y1 = max(0, y1 - pad_y)
+        new_y2 = min(h, y2 + pad_y)
+        
+        # Crop and resize to 640x640 (what model expects)
+        person_crop = frame[new_y1:new_y2, new_x1:new_x2]
+        
+        if person_crop.size == 0:
+            return None
+        
+        person_resized = cv2.resize(person_crop, (640, 640))
+        
+        return person_resized, (new_x1, new_y1, new_x2, new_y2)
+    
+    if video_file is not None:
+        # Display video preview
+        st.video(video_file)
+        
+        if st.button("🎬 Process Video Queue", key="scan_video_queue", type="primary"):
+            if not thermal_online:
+                st.error("❌ Thermal API is not running. Please start it with: python thermal_api.py")
+            else:
+                with st.spinner("Processing video - extracting frames and detecting weapons..."):
+                    try:
+                        # Load person detector
+                        person_model = load_person_detector()
+                        
+                        # Save uploaded video to temporary file
+                        temp_video_path = Path("temp_uploaded_video.mp4")
+                        with open(temp_video_path, "wb") as f:
+                            f.write(video_file.read())
+                        
+                        # Open video with OpenCV
+                        cap = cv2.VideoCapture(str(temp_video_path))
+                        
+                        if not cap.isOpened():
+                            st.error("Could not open video file")
+                        else:
+                            # Get video info
+                            fps = int(cap.get(cv2.CAP_PROP_FPS))
+                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                            duration = total_frames / fps if fps > 0 else 0
+                            
+                            st.info(f"📹 Video info: {duration:.1f} seconds, {fps} fps, {total_frames} frames")
+                            st.info(f"🔧 Using {padding_percent*100:.0f}% padding around each person to capture full body (including pockets)")
+                            
+                            # Determine frame indices to extract
+                            if total_frames <= num_frames_to_extract:
+                                frame_indices = list(range(total_frames))
+                            else:
+                                step = total_frames // num_frames_to_extract
+                                frame_indices = [i * step for i in range(num_frames_to_extract)]
+                            
+                            st.info(f"📸 Extracting {len(frame_indices)} frames")
+                            
+                            # Store results per frame
+                            all_frames_results = []
+                            processed_frames = []
+                            
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            
+                            for idx, frame_num in enumerate(frame_indices):
+                                status_text.text(f"Processing frame {idx+1}/{len(frame_indices)}...")
+                                
+                                # Seek to frame
+                                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+                                ret, frame = cap.read()
+                                
+                                if not ret:
+                                    continue
+                                
+                                # Calculate timestamp
+                                timestamp = frame_num / fps if fps > 0 else 0
+                                
+                                # ========== PREPROCESS: Color mapping ==========
+                                frame_processed = preprocess_thermal_frame(frame, colormap_option)
+                                
+                                # Detect people in this frame
+                                person_results = person_model(frame_processed, verbose=False)
+                                
+                                person_boxes = []
+                                for result in person_results:
+                                    if result.boxes is not None:
+                                        for box in result.boxes:
+                                            class_id = int(box.cls[0])
+                                            if person_model.names[class_id] == "person":
+                                                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                                                conf = float(box.conf[0])
+                                                person_boxes.append({
+                                                    "bbox": [x1, y1, x2, y2],
+                                                    "confidence": conf
+                                                })
+                                
+                                # Sort left to right
+                                person_boxes.sort(key=lambda p: p["bbox"][0])
+                                
+                                frame_results = []
+                                for person_idx, person in enumerate(person_boxes):
+                                    person_num = person_idx + 1
+                                    
+                                    # ========== SMART CROP with padding ==========
+                                    crop_result = smart_crop_person(
+                                        frame_processed, 
+                                        person["bbox"], 
+                                        padding_percent
+                                    )
+                                    
+                                    if crop_result is None:
+                                        continue
+                                    
+                                    person_resized, expanded_bbox = crop_result
+                                    
+                                    # Run weapon detection via API
+                                    _, encoded = cv2.imencode('.jpg', person_resized)
+                                    files = {"file": encoded.tobytes()}
+                                    data = {"confidence": confidence_threshold_video}
+                                    
+                                    try:
+                                        response = requests.post(THERMAL_API_URL, files=files, data=data, timeout=30)
+                                        if response.status_code == 200:
+                                            result = response.json()
+                                            weapons = result.get("weapon_analysis", {}).get("weapons", []) if result.get("weapon_analysis") else []
+                                        else:
+                                            weapons = []
+                                    except Exception as e:
+                                        weapons = []
+                                    
+                                    has_weapon = len(weapons) > 0
+                                    
+                                    # Extract head (top 30% of original crop, not resized)
+                                    head_h = int((person["bbox"][3] - person["bbox"][1]) * 0.3)
+                                    head_img = frame_processed[person["bbox"][1]:person["bbox"][1]+head_h, 
+                                                                person["bbox"][0]:person["bbox"][2]]
+                                    
+                                    frame_results.append({
+                                        "person_num": person_num,
+                                        "has_weapon": has_weapon,
+                                        "weapons": weapons,
+                                        "head_image": head_img,
+                                        "person_image": person_resized
+                                    })
+                                
+                                all_frames_results.append({
+                                    "frame_index": frame_num,
+                                    "timestamp": timestamp,
+                                    "results": frame_results,
+                                    "num_people": len(person_boxes)
+                                })
+                                
+                                # Store processed frame for display (with bounding boxes drawn)
+                                frame_with_boxes = frame_processed.copy()
+                                for person in person_boxes:
+                                    x1, y1, x2, y2 = person["bbox"]
+                                    cv2.rectangle(frame_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                processed_frames.append(frame_with_boxes)
+                                
+                                progress_bar.progress((idx + 1) / len(frame_indices))
+                            
+                            cap.release()
+                            temp_video_path.unlink()
+                            
+                            status_text.text("Processing complete! Aggregating results...")
+                            
+                            # ========== AGGREGATE RESULTS ACROSS FRAMES ==========
+                            max_people = max([f["num_people"] for f in all_frames_results]) if all_frames_results else 0
+                            
+                            # Track weapon detections per person across frames
+                            person_tracking = {}
+                            for person_num in range(1, max_people + 1):
+                                person_tracking[person_num] = {
+                                    "weapon_frames": [],
+                                    "weapon_details": [],
+                                    "head_image": None,
+                                    "person_image": None,
+                                    "first_weapon_timestamp": None
+                                }
+                            
+                            for frame_data in all_frames_results:
+                                timestamp = frame_data["timestamp"]
+                                for person_result in frame_data["results"]:
+                                    pn = person_result["person_num"]
+                                    if person_result["has_weapon"]:
+                                        person_tracking[pn]["weapon_frames"].append(timestamp)
+                                        for w in person_result["weapons"]:
+                                            person_tracking[pn]["weapon_details"].append({
+                                                "timestamp": timestamp,
+                                                "weapon": "Gun",
+                                                "confidence": w["confidence"]
+                                            })
+                                        if person_tracking[pn]["head_image"] is None:
+                                            person_tracking[pn]["head_image"] = person_result["head_image"]
+                                        if person_tracking[pn]["first_weapon_timestamp"] is None:
+                                            person_tracking[pn]["first_weapon_timestamp"] = timestamp
+                            
+                            # Determine alerts based on confirmation threshold
+                            alert_persons = []
+                            for person_num, data in person_tracking.items():
+                                unique_frames = len(set(data["weapon_frames"]))
+                                if unique_frames >= min_confirmation_frames:
+                                    alert_persons.append({
+                                        "person_num": person_num,
+                                        "weapon_frames": data["weapon_frames"],
+                                        "weapon_details": data["weapon_details"],
+                                        "head_image": data["head_image"],
+                                        "first_alert": data["first_weapon_timestamp"]
+                                    })
+                            
+                            # ========== DISPLAY RESULTS ==========
+                            st.markdown("---")
+                            st.subheader("📊 Processed Frames Preview")
+                            st.caption(f"Color mapping: **{colormap_option}** | Person padding: **{padding_percent*100:.0f}%**")
+                            
+                            # Show processed frames
+                            frame_cols = st.columns(min(len(processed_frames), 4))
+                            for idx, frame in enumerate(processed_frames):
+                                col_idx = idx % 4
+                                with frame_cols[col_idx]:
+                                    st.image(frame, caption=f"Frame {idx+1} (t={all_frames_results[idx]['timestamp']:.1f}s)", use_container_width=True)
+                            
+                            # ========== ALERT SUMMARY ==========
+                            st.markdown("---")
+                            st.subheader("🚨 VIDEO QUEUE ALERT SUMMARY")
+                            
+                            if len(alert_persons) > 0:
+                                st.markdown(f'<div class="alert-red">⚠️ ALERT: {len(alert_persons)} person(s) confirmed with weapons across {min_confirmation_frames}+ frames!</div>', unsafe_allow_html=True)
+                                
+                                for ap in alert_persons:
+                                    weapons_list = list(set([w["weapon"] for w in ap["weapon_details"]]))
+                                    weapons_str = ", ".join(weapons_list)
+                                    timestamps_str = ", ".join([f"{t:.1f}s" for t in ap["weapon_frames"]])
+                                    
+                                    if ap["person_num"] == 1:
+                                        position = "leftmost (first to enter)"
+                                    elif ap["person_num"] == max_people:
+                                        position = "rightmost (last to leave)"
+                                    else:
+                                        position = f"{ap['person_num']}th from left"
+                                    
+                                    st.write(f"🔴 **Person {ap['person_num']}** ({position}): {weapons_str} detected at {timestamps_str}")
+                                
+                                # Display heads of alerted persons
+                                st.subheader("👤 Security Alert - Identify These Individuals")
+                                head_cols = st.columns(min(len(alert_persons), 4))
+                                for idx, ap in enumerate(alert_persons):
+                                    if idx < len(head_cols) and ap["head_image"] is not None:
+                                        with head_cols[idx]:
+                                            st.image(ap["head_image"], caption=f"Person {ap['person_num']} (SUSPECT)", use_container_width=True)
+                                
+                                # Timeline visualization
+                                st.subheader("📈 Detection Timeline")
+                                timeline_data = []
+                                for ap in alert_persons:
+                                    for wd in ap["weapon_details"]:
+                                        timeline_data.append({
+                                            "Person": f"Person {ap['person_num']}",
+                                            "Time (s)": f"{wd['timestamp']:.1f}",
+                                            "Weapon": wd["weapon"],
+                                            "Confidence": f"{wd['confidence']:.0%}"
+                                        })
+                                if timeline_data:
+                                    st.dataframe(timeline_data, use_container_width=True)
+                                
+                            else:
+                                st.markdown(f'<div class="alert-green">✅ CLEAR: No weapons confirmed across {min_confirmation_frames}+ frames</div>', unsafe_allow_html=True)
+                            
+                            # ========== FULL DETAILS TABLE ==========
+                            with st.expander("View full frame-by-frame details"):
+                                details_data = []
+                                for frame_data in all_frames_results:
+                                    for person_result in frame_data["results"]:
+                                        if person_result["has_weapon"]:
+                                            weapons_str = ", ".join([w["class_name"] for w in person_result["weapons"]])
+                                        else:
+                                            weapons_str = "None"
+                                        details_data.append({
+                                            "Frame": frame_data["frame_index"],
+                                            "Time (s)": f"{frame_data['timestamp']:.1f}",
+                                            "Person": person_result["person_num"],
+                                            "Weapons": weapons_str
+                                        })
+                                if details_data:
+                                    st.dataframe(details_data, use_container_width=True)
+                            
+                            # Helpful tip if no detections
+                            if len(alert_persons) == 0 and len(all_frames_results) > 0:
+                                st.info("💡 **No weapons detected. Try:**\n"
+                                        "- Increasing 'Person Crop Padding' (0.4-0.5) to capture more of the body\n"
+                                        "- Lowering the confidence threshold\n"
+                                        "- Selecting a different color mapping (HOT, INFERNO, etc.)\n"
+                                        "- Extracting more frames from the video")
+                            
+                            st.session_state.video_queue_results = alert_persons
+                            
+                            status_text.text("")
+                            progress_bar.empty()
+                            
+                    except Exception as e:
+                        st.error(f"Error processing video: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+                        
 st.markdown("---")
 st.caption("⚠️ Disclaimer: This system is for research purposes. Always follow official security protocols.")
