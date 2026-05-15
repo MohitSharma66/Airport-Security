@@ -1,0 +1,33 @@
+path: C:/Users/mohit/Documents/STCray_Project/datasets/STCray
+train: images/train
+val: images/val
+
+# Number of classes (24, not 22 as originally thought)
+nc: 24
+
+# EXACT class names from the conversion output
+names:
+  0: Explosive
+  1: Gun
+  2: "3D Gun"
+  3: Knife
+  4: Cutter
+  5: Blade
+  6: "Shaving Razor"
+  7: Lighter
+  8: Injection
+  9: Battery
+  10: "Nail Cutter"
+  11: "Other Sharp Item"
+  12: Powerbank
+  13: Scissors
+  14: Hammer
+  15: Pliers
+  16: Wrench
+  17: Screwdriver
+  18: Handcuffs
+  19: Bullet
+  20: "Multilabel Threat"
+  21: "Non Threat"
+  22: "3D printed gun"
+  23: Syringe

@@ -1,0 +1,22 @@
+# Datasets
+datasets/
+
+# Training outputs
+runs/
+
+# Generated images
+queue_test_images/
+bag_queue_test_images/
+alerts/
+
+# Model weights
+*.pt
+*.onnx
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+.env
